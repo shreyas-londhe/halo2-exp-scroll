@@ -15,17 +15,18 @@ use halo2_proofs::{
 //    - Constrain the final result to match the provided result value
 
 // Initial state:
-// exp | base | start | end
-// 0   | b    | 1     | 1
-// 1   | b    | 1     | b
-// 0   | b    | b     | b^2
-// 1   | b    | b^2   | b^3
+// bit | base | start | end  | pow2 (fixed)        | n2b
+// 0   | b    | 1     | 1    | 2^(exp_bit_len)     | cur(pow2) * cur(bit)
+// 1   | b    | 1     | b    | 2^(exp_bit_len - 1) | cur(pow2) * cur(bit) + prev
+// 0   | b    | b     | b^2  | 2^(exp_bit_len - 2) | cur(pow2) * cur(bit) + prev
+// 1   | b    | b^2   | b^3  | 2^(exp_bit_len - 3) | cur(pow2) * cur(bit) + prev
 
 #[derive(Clone)]
 pub struct ExpConfig {
     bit_selector: Selector,
     exp_selector: Selector,
-    advice: [Column<Advice>; 4],
+    n2b_selector: Selector,
+    advice: [Column<Advice>; 6],
     instance: Column<Instance>,
 }
 
@@ -33,17 +34,22 @@ impl ExpConfig {
     pub fn configure<F: PrimeField>(meta: &mut ConstraintSystem<F>) -> Self {
         let bit_selector = meta.selector();
         let exp_selector = meta.selector();
+        let n2b_selector = meta.selector();
 
         let col_bit = meta.advice_column();
         let col_base = meta.advice_column();
         let col_a = meta.advice_column();
         let col_b = meta.advice_column();
+        let col_pow2 = meta.advice_column();
+        let col_n2b = meta.advice_column();
         let instance = meta.instance_column();
 
         meta.enable_equality(col_bit);
         meta.enable_equality(col_base);
         meta.enable_equality(col_a);
         meta.enable_equality(col_b);
+        meta.enable_equality(col_pow2);
+        meta.enable_equality(col_n2b);
         meta.enable_equality(instance);
 
         meta.create_gate("bit constraint", |meta| {
@@ -68,10 +74,21 @@ impl ExpConfig {
             ]
         });
 
+        meta.create_gate("n2b constraint", |meta| {
+            let s = meta.query_selector(n2b_selector);
+            let pow2 = meta.query_advice(col_pow2, Rotation::cur());
+            let bit = meta.query_advice(col_bit, Rotation::cur());
+            let prev = meta.query_advice(col_n2b, Rotation::prev());
+            let n2b = meta.query_advice(col_n2b, Rotation::cur());
+
+            vec![s * (pow2 * bit + prev - n2b) * Expression::Constant(F::from(0))]
+        });
+
         Self {
             bit_selector,
             exp_selector,
-            advice: [col_bit, col_base, col_a, col_b],
+            n2b_selector,
+            advice: [col_bit, col_base, col_a, col_b, col_pow2, col_n2b],
             instance,
         }
     }
@@ -80,8 +97,9 @@ impl ExpConfig {
         &self,
         layouter: &mut impl Layouter<F>,
         bit: Value<F>,
-        base: Value<F>
-    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), Error> {
+        base: Value<F>,
+        pow2_exp_bits: Value<F>
+    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>, AssignedCell<F, F>), Error> {
         layouter.assign_region(
             || "assign first row",
             |mut region| {
@@ -116,7 +134,21 @@ impl ExpConfig {
                     || Value::known(F::ONE) - bit + base * bit
                 )?;
 
-                Ok((base_cell, res_cell))
+                region.assign_advice(
+                    || "assign max pow2",
+                    self.advice[4],
+                    0,
+                    || pow2_exp_bits
+                )?;
+
+                let n2b_cell = region.assign_advice(
+                    || "assign n2b",
+                    self.advice[5],
+                    0,
+                    || bit * pow2_exp_bits
+                )?;
+
+                Ok((base_cell, res_cell, n2b_cell))
             }
         )
     }
@@ -125,14 +157,17 @@ impl ExpConfig {
         &self,
         layouter: &mut impl Layouter<F>,
         bit: Value<F>,
+        pow2: Value<F>,
         base_cell: AssignedCell<F, F>,
-        res_cell: AssignedCell<F, F>
-    ) -> Result<AssignedCell<F, F>, Error> {
+        res_cell: AssignedCell<F, F>,
+        prev_n2b_cell: AssignedCell<F, F>
+    ) -> Result<(AssignedCell<F, F>, AssignedCell<F, F>), Error> {
         layouter.assign_region(
             || "exp prove layer",
             |mut region| {
                 self.bit_selector.enable(&mut region, 0)?;
                 self.exp_selector.enable(&mut region, 0)?;
+                self.n2b_selector.enable(&mut region, 0)?;
 
                 region.assign_advice(
                     || "assign bit",
@@ -160,7 +195,23 @@ impl ExpConfig {
                     || start * start * (Value::known(F::ONE) - bit) + start * start * base * bit
                 )?;
 
-                Ok(end_cell)
+                region.assign_advice(
+                    || "assign pow2",
+                    self.advice[4],
+                    0,
+                    || pow2
+                )?;
+
+                let prev_n2b = prev_n2b_cell.value().map(|x| x.to_owned());
+
+                let n2b_cell = region.assign_advice(
+                    || "assign n2b",
+                    self.advice[5],
+                    0,
+                    || pow2 * bit + prev_n2b
+                )?;
+
+                Ok((end_cell, n2b_cell))
             }
         )
     }
@@ -180,7 +231,7 @@ impl ExpConfig {
 #[derive(Default)]
 struct ExpCircuit<F> {
     base: Value<F>,
-    exp_bits: Vec<Value<F>>, // big-endian
+    exp_bits: Vec<Value<F>>,
 }
 
 impl<F: PrimeField> Circuit<F> for ExpCircuit<F> {
@@ -200,17 +251,26 @@ impl<F: PrimeField> Circuit<F> for ExpCircuit<F> {
         config: Self::Config,
         mut layouter: impl Layouter<F>
     ) -> Result<(), Error> {
-        let (base_cell, mut res_cell) = config.assign_first_row(
+        let (base_cell, mut res_cell, mut n2b) = config.assign_first_row(
             &mut layouter,
             self.exp_bits[0],
-            self.base
+            self.base,
+            Value::known(F::from(1 << (self.exp_bits.len() - 1)))
         )?;
 
-        for bit in self.exp_bits.iter().skip(1) {
-            res_cell = config.exp_prove_layer(&mut layouter, *bit, base_cell.clone(), res_cell)?;
+        for (i, bit) in self.exp_bits.iter().skip(1).enumerate() {
+            (res_cell, n2b) = config.exp_prove_layer(
+                &mut layouter,
+                *bit,
+                Value::known(F::from(1 << (self.exp_bits.len() - 2 - i))),
+                base_cell.clone(),
+                res_cell,
+                n2b.clone()
+            )?;
         }
 
         config.expose_public(&mut layouter, &res_cell, 0)?;
+        config.expose_public(&mut layouter, &n2b, 1)?;
 
         Ok(())
     }
@@ -228,7 +288,7 @@ mod tests {
         // 2^3 = 8
 
         let k = 4;
-        let public_inputs = vec![Fp::from(8)];
+        let public_inputs = vec![Fp::from(8), Fp::from(3)]; // exp, exp_num_bits
         let circuit = ExpCircuit::<Fp> {
             base: Value::known(Fp::from(2)),
             exp_bits: vec![
@@ -247,7 +307,7 @@ mod tests {
         // 2^3 = 8
 
         let k = 4;
-        let public_inputs = vec![Fp::from(8)];
+        let public_inputs = vec![Fp::from(8), Fp::from(3)]; // exp, exp_num_bits
         let circuit = ExpCircuit::<Fp> {
             base: Value::known(Fp::from(2)),
             exp_bits: vec![
