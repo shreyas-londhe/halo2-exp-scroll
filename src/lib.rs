@@ -25,6 +25,7 @@ use halo2_proofs::{
 pub struct ExpConfig {
     bit_selector: Selector,
     exp_selector: Selector,
+    first_n2b_selector: Selector,
     n2b_selector: Selector,
     advice: [Column<Advice>; 6],
     instance: Column<Instance>,
@@ -34,6 +35,7 @@ impl ExpConfig {
     pub fn configure<F: PrimeField>(meta: &mut ConstraintSystem<F>) -> Self {
         let bit_selector = meta.selector();
         let exp_selector = meta.selector();
+        let first_n2b_selector = meta.selector();
         let n2b_selector = meta.selector();
 
         let col_bit = meta.advice_column();
@@ -74,6 +76,15 @@ impl ExpConfig {
             ]
         });
 
+        meta.create_gate("first n2b constraint", |meta| {
+            let s = meta.query_selector(first_n2b_selector);
+            let pow2 = meta.query_advice(col_pow2, Rotation::cur());
+            let bit = meta.query_advice(col_bit, Rotation::cur());
+            let n2b = meta.query_advice(col_n2b, Rotation::cur());
+
+            vec![s * (pow2 * bit - n2b)]
+        });
+
         meta.create_gate("n2b constraint", |meta| {
             let s = meta.query_selector(n2b_selector);
             let pow2 = meta.query_advice(col_pow2, Rotation::cur());
@@ -81,12 +92,13 @@ impl ExpConfig {
             let prev = meta.query_advice(col_n2b, Rotation::prev());
             let n2b = meta.query_advice(col_n2b, Rotation::cur());
 
-            vec![s * (pow2 * bit + prev - n2b) * Expression::Constant(F::from(0))]
+            vec![s * (pow2 * bit + prev - n2b)]
         });
 
         Self {
             bit_selector,
             exp_selector,
+            first_n2b_selector,
             n2b_selector,
             advice: [col_bit, col_base, col_a, col_b, col_pow2, col_n2b],
             instance,
@@ -105,6 +117,7 @@ impl ExpConfig {
             |mut region| {
                 self.bit_selector.enable(&mut region, 0)?;
                 self.exp_selector.enable(&mut region, 0)?;
+                self.first_n2b_selector.enable(&mut region, 0)?;
 
                 region.assign_advice(
                     || "assign bit",
